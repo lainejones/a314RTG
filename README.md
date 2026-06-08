@@ -7,11 +7,17 @@ process diffs that framebuffer and streams **only the changed pixels** to the Pi
 over the A314 clockport link, and the Pi paints them to its HDMI output via
 `/dev/fb0`.
 
-> **Status: experimental / work-in-progress.** It has reached a working state —
-> the board registers with Picasso96, and opening a 640×480 or 800×600 screen
-> renders Workbench on the Pi's HDMI in both 16-bit (R5G6B5) and 8-bit (CLUT)
-> modes. It is shared here for others to read, build, and improve. See
-> [Milestones](#milestones).
+> ⚠️ **Proof of concept — and it is SLOW.** This was built to prove the idea
+> works, not to be a practical day-to-day RTG card. It **will always be slow**:
+> the A314 clockport is a ~70–120 KB/s byte-at-a-time link, so a full screen
+> repaint takes several seconds — there is no way around that with this
+> transport. It's fine for a mostly-static Workbench, not for animation/video.
+>
+> It is also **work-in-progress and does not work with every configuration** —
+> it's been exercised on one setup (see [Hardware](#hardware)) at 640×480 /
+> 800×600 in 16-bit and 8-bit, and other machines/modes/A314 variants are
+> untested and may not work. Shared here for others to read, build, and improve.
+> See [Milestones](#milestones).
 
 ## Why a diff, not a shared framebuffer?
 
