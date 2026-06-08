@@ -1,0 +1,6 @@
+# Sources build under WSL / amiga-gcc; keep LF endings in the working tree.
+* text=auto eol=lf
+*.info binary
+*.card binary
+*.lha binary
+*.png binary

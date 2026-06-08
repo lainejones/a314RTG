@@ -1,0 +1,36 @@
+# --- Third-party SDKs: not redistributed here. Fetch from upstream and place
+#     alongside this repo as described in README.md "Building". ---
+Picasso96Develop/
+P96Develop/
+P96CardDevelop/
+P96Develop.lha
+P96CardDevelop.lha
+*.lha
+a314-1.2.3/
+
+# --- Build outputs / compiled binaries (regenerate with `make`) ---
+*.o
+rtg/a314rtg.card
+rtg/a314test
+rtg/carvetest
+rtg/carvetest2
+rtg/gctest
+rtg/loadtest
+
+# --- Local/reference binaries not part of the source ---
+# (inline comments aren't allowed in .gitignore patterns - keep them separate)
+# dead stub binary (monitor_start.S is superseded)
+rtg/a314rtg.monitor
+# local copy of the stock Picasso96 monitor loader
+rtg/p96monitor
+# reference: a stock Altais monitor program
+rtg/ref_Altais
+rtg/ref_Altais.info
+# compiled tools/rtgmodes.c
+tools/RTGModes
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+*~
+*.swp
