@@ -15,10 +15,12 @@ TARGET      = a314rtg.card
 # PiDisk:rtg/ on the Amiga always has the latest. The monitor is deployed
 # WITHOUT an extension (a314rtg) so it can be copied straight to
 # DEVS:Monitors/. The Pi-side service rtg.py is synced to /opt/a314/.
-PI_HOST    = laine@192.168.50.126
+# "a314cp" is a WSL ~/.ssh/config alias (192.168.50.33, key auth). A bare
+# user@ip here would fall back to password prompts and hang scripted deploys.
+PI_HOST    = a314cp
 PI_SHARE   = /home/laine/a314shared/rtg
 PI_SVC     = /opt/a314/rtg.py
-SSHOPTS    = -o StrictHostKeyChecking=no -o ConnectTimeout=8
+SSHOPTS    = -o StrictHostKeyChecking=no -o ConnectTimeout=8 -o BatchMode=yes
 
 # The "monitor" deployed to DEVS:Monitors/ is the STOCK P96 loader program
 # (p96monitor, a board-agnostic copy of the standard Picasso96 monitor program),
@@ -49,5 +51,10 @@ deploy: $(TARGET) p96monitor a314rtg.info
 	@echo "      a314rtg      -> DEVS:Monitors/"
 	@echo "      a314rtg.info -> DEVS:Monitors/"
 
+# CLI harness validating the mmu.library dirty-page path on a live machine.
+mmutest: mmutest.c
+	$(CC) -m68020 -O2 -noixemul -o $@ mmutest.c
+	-scp $(SSHOPTS) mmutest $(PI_HOST):$(PI_SHARE)/mmutest
+
 clean:
-	rm -f $(TARGET) *.o
+	rm -f $(TARGET) mmutest *.o

@@ -54,6 +54,7 @@ CMD_FILL       = 5    # 16-bit: x2 y2 n2 + 2 raw bytes
 CMD_SETPALETTE = 6    # 8-bit:  start1 count1 + count*2 RGB565-LE
 CMD_PIXELS8    = 7    # 8-bit:  x2 y2 n1 + n CLUT-index bytes
 CMD_FILL8      = 8    # 8-bit:  x2 y2 n2 + 1 CLUT-index byte
+CMD_DEBUG      = 9    # panwidth2 bpr2 rgbf1 bpp1 flags1 - journal only
 
 
 def read_fb_size():
@@ -184,6 +185,20 @@ class RTGService:
                 ci = b[7]
                 del b[:8]
                 self._fill8(x, y, n, ci)
+            elif c == CMD_DEBUG:
+                if len(b) < 22:
+                    break
+                panw, bpr = struct.unpack_from('>HH', b, 1)
+                rgbf, bpp, flags = b[5], b[6], b[7]
+                vb, fb = struct.unpack_from('>II', b, 8)
+                ribpr, = struct.unpack_from('>H', b, 16)
+                rimem, = struct.unpack_from('>I', b, 18)
+                del b[:22]
+                log.info('DEBUG panwidth=%d bpr=%d rgbf=%d bpp=%d mmu=%d swap=%d '
+                         'mmustage=%d vbase=0x%08x fbase=0x%08x '
+                         'ri_bpr=%d ri_mem=0x%08x',
+                         panw, bpr, rgbf, bpp, flags & 1, (flags >> 1) & 1,
+                         (flags >> 4) & 15, vb, fb, ribpr, rimem)
             else:
                 log.warning('unknown command 0x%02x - flushing stream', c)
                 b.clear()

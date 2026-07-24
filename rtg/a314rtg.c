@@ -45,7 +45,7 @@
  * ====================================================================== */
 
 #define VERSION   1
-#define REVISION  0
+#define REVISION  1
 
 struct A314RTGBase {
     struct Library   libNode;
@@ -71,7 +71,7 @@ struct A314RTGBase *InitLib(struct ExecBase *sysbase __asm("a6"),
                                      struct A314RTGBase *base __asm("d0"));
 
 char device_name[]      = "a314rtg.card";
-char device_id_string[] = "a314rtg.card 1.0 (29.05.2026)\r\n";
+char device_id_string[] = "a314rtg.card 1.1 (24.07.2026)\r\n";
 
 static const APTR device_vectors[] = {
     (APTR)OpenLib,
@@ -181,7 +181,15 @@ static volatile UWORD mode_w   = 0;     /* visible width  in pixels         */
 static volatile UWORD mode_h   = 0;     /* visible height in pixels         */
 static volatile UWORD mode_bpr = 0;     /* bytes per row (bitmap stride)     */
 static volatile UWORD pan_width = 0;    /* SetPanning bitmap width (pixels)  */
-static volatile UBYTE mode_bpp = 16;
+static volatile UBYTE mode_bpp  = 16;
+static volatile UBYTE mode_rgbf = 0;     /* raw RGBFTYPE from SetPanning      */
+static volatile UWORD ri_bpr    = 0;     /* P96's own RenderInfo BytesPerRow  */
+static volatile ULONG ri_mem    = 0;     /* ...and Memory, seen in FillRect   */
+static volatile BOOL  dbg_dirty = FALSE;
+static volatile BOOL  mode_swap = FALSE; /* 16-bit big-endian mode: swap pixel
+                                          * bytes into the wire packets so the
+                                          * Pi's LE RGB565 fb shows true colour
+                                          * (shadow keeps frame bytes) */
 static volatile BOOL  mode_changed  = FALSE;
 static volatile BOOL  switch_state  = TRUE;
 static volatile BOOL  switch_changed = FALSE;
@@ -211,6 +219,8 @@ static volatile BOOL  palette_changed = FALSE;
 #define CMD_SETPALETTE 6   /* 8-bit:  start1 count1 + count*2 RGB565-LE */
 #define CMD_PIXELS8    7   /* 8-bit:  x2 y2 n1 + n CLUT-index bytes      */
 #define CMD_FILL8      8   /* 8-bit:  x2 y2 n2 + 1 CLUT-index byte       */
+#define CMD_DEBUG      9   /* panwidth(2) bpr(2) rgbf(1) bpp(1) mmu(1) - the
+                            * Pi just journals it; sent on every mode change */
 
 #define MAX_IDX_PER_PKT  240         /* 6 + 240 = 246 <= 252 (8-bit pixels)  */
 #define PAL_PER_PKT      120         /* 3 + 120*2 = 243 <= 252 (palette)     */
@@ -250,6 +260,155 @@ static UWORD bpp_bytes(UWORD depth)
     if (depth <= 16) return 2;
     if (depth <= 24) return 3;
     return 4;
+}
+
+/* ---- mmu.library dirty-page tracking (optional fast path) ----------------
+ *
+ * Idea (suggested by eriQue): instead of re-comparing the whole framebuffer
+ * against the shadow every pass, ask the 68030's MMU which pages were written.
+ * Every page descriptor carries a hardware-maintained M (modified) bit; the
+ * mmu.library V43+ call GetPageUsedModified() reads AND clears it atomically
+ * (including the ATC flush that raw table peeking would get wrong).
+ *
+ * We NEVER touch PMMU registers directly - this machine runs MMULib/MuForce,
+ * which owns the MMU tree. Everything goes through mmu.library, and the whole
+ * path self-validates at init with a probe write: if the M-bit doesn't report
+ * it (no MMU tree, transparent translation, whatever), mmu_active stays FALSE
+ * and diffing falls back to full scanning, exactly as before. A periodic
+ * reconciliation sweep re-diffs everything anyway, so even a lying M-bit can
+ * only delay an update, never lose it.
+ */
+
+#define MAPP_USED        (1UL << 3)    /* from MMULib mmu/context.h */
+#define MAPP_MODIFIED    (1UL << 4)
+#define MAPP_SINGLEPAGE  (1UL << 12)   /* page-level calls REQUIRE this */
+
+static struct Library *MMUBase   = NULL;
+static APTR            mmu_ctx   = NULL;
+static ULONG           mmu_pgsz  = 0;
+static BOOL            mmu_active = FALSE;
+static UBYTE           mmu_stage  = 0;  /* how far init got (CMD_DEBUG):
+                                         * 0=no lib 1=no ctx 2=bad pgsz
+                                         * 3=SetProps failed 4=Rebuild failed
+                                         * 5=probe failed 6=ACTIVE */
+
+/* Row-needs-diff flags driving the send loop (indexed by screen row). */
+static UBYTE dirty_rows[FB_HEIGHT_MAX];
+
+#define RECON_EVERY 128        /* full re-diff every ~5s as a safety net */
+static UWORD recon_countdown = 0;
+static ULONG last_vbase = 0;   /* pan/stride change detection */
+static UWORD last_bpr   = 0;
+
+static void mark_all_rows(void)
+{
+    UWORD i;
+    for (i = 0; i < FB_HEIGHT_MAX; i++) dirty_rows[i] = 1;
+}
+
+/* Call stubs - no amiga.lib glue exists for mmu.library. Standard AmigaOS
+ * convention: d0/d1/a0/a1 are scratch, the rest is preserved. LVOs from
+ * MMULib's mmu_pragmas.h. */
+
+static APTR mmu_CurrentContext(void)            /* LVO -0x0f0, a1=task */
+{
+    register APTR res  __asm("d0");
+    register APTR task __asm("a1") = NULL;
+    register APTR lib  __asm("a6") = (APTR)MMUBase;
+    __asm__ volatile ("jsr -240(%%a6)"
+        : "=r"(res), "+r"(task), "+r"(lib) : : "d1", "a0", "cc", "memory");
+    return res;
+}
+
+static ULONG mmu_GetPageSize(APTR ctx)          /* LVO -0x030, a0=ctx */
+{
+    register ULONG res __asm("d0");
+    register APTR  c   __asm("a0") = ctx;
+    register APTR  lib __asm("a6") = (APTR)MMUBase;
+    __asm__ volatile ("jsr -48(%%a6)"
+        : "=r"(res), "+r"(c), "+r"(lib) : : "d1", "a1", "cc", "memory");
+    return res;
+}
+
+static ULONG mmu_GetPageUsedModified(APTR ctx, ULONG lower)
+{                                               /* LVO -0x17a, a0=ctx a1=lower */
+    register ULONG res __asm("d0");
+    register APTR  c   __asm("a0") = ctx;
+    register ULONG lo  __asm("a1") = lower;
+    register APTR  lib __asm("a6") = (APTR)MMUBase;
+    __asm__ volatile ("jsr -378(%%a6)"
+        : "=r"(res), "+r"(c), "+r"(lo), "+r"(lib) : : "d1", "cc", "memory");
+    return res;
+}
+
+static BOOL mmu_SetPropertiesA(APTR ctx, ULONG flags, ULONG mask,
+                               ULONG lower, ULONG size, APTR tags)
+{               /* LVO -0x054, a0=ctx d1=flags d2=mask a1=lower d0=size a2=tags */
+    register ULONG res __asm("d0") = size;     /* d0 is input AND result */
+    register APTR  c   __asm("a0") = ctx;
+    register ULONG fl  __asm("d1") = flags;
+    register ULONG ma  __asm("d2") = mask;
+    register ULONG lo  __asm("a1") = lower;
+    register APTR  tg  __asm("a2") = tags;
+    register APTR  lib __asm("a6") = (APTR)MMUBase;
+    __asm__ volatile ("jsr -84(%%a6)"
+        : "+r"(res), "+r"(c), "+r"(fl), "+r"(lo), "+r"(lib)
+        : "r"(ma), "r"(tg) : "cc", "memory");
+    return (BOOL)res;
+}
+
+static BOOL mmu_RebuildTree(APTR ctx)           /* LVO -0x060, a0=ctx */
+{
+    register ULONG res __asm("d0");
+    register APTR  c   __asm("a0") = ctx;
+    register APTR  lib __asm("a6") = (APTR)MMUBase;
+    __asm__ volatile ("jsr -96(%%a6)"
+        : "=r"(res), "+r"(c), "+r"(lib) : : "d1", "a1", "cc", "memory");
+    return (BOOL)res;
+}
+
+/* One-time init, run from the diff process (safe user context). Any failure
+ * just leaves mmu_active FALSE - the full-scan fallback is always correct. */
+static void mmu_init(void)
+{
+    ULONG base, size, p;
+    volatile UBYTE *probe;
+    static struct TagItem done = { TAG_DONE, 0 };
+
+    if (MMUBase) return;                        /* only try once per boot */
+    MMUBase = OpenLibrary((STRPTR)"mmu.library", 43);
+    if (!MMUBase) return;                       /* V43+ needed for UsedModified */
+
+    mmu_stage = 1;
+    mmu_ctx = mmu_CurrentContext();
+    if (!mmu_ctx) return;
+    mmu_stage = 2;
+    mmu_pgsz = mmu_GetPageSize(mmu_ctx);
+    if (!mmu_pgsz || (mmu_pgsz & (mmu_pgsz - 1)) || mmu_pgsz > 65536) return;
+    mmu_stage = 3;
+
+    /* Force per-page descriptors over the whole card memory (visible_base can
+     * sit anywhere inside it). Without MAPP_SINGLEPAGE a large block descriptor
+     * could cover the region and page-level queries are not permitted. */
+    base = (ULONG)framebuffer & ~(mmu_pgsz - 1);
+    size = (((ULONG)framebuffer + CARD_MEM_SIZE + mmu_pgsz - 1)
+            & ~(mmu_pgsz - 1)) - base;
+    if (!mmu_SetPropertiesA(mmu_ctx, MAPP_SINGLEPAGE, MAPP_SINGLEPAGE,
+                            base, size, (APTR)&done)) return;
+    mmu_stage = 4;
+    if (!mmu_RebuildTree(mmu_ctx)) return;
+    mmu_stage = 5;
+
+    /* Clear stale M-bits, then prove the path end-to-end with one real write:
+     * if the hardware doesn't report it, never trust the MMU on this setup. */
+    for (p = base; p < base + size; p += mmu_pgsz)
+        (void)mmu_GetPageUsedModified(mmu_ctx, p);
+    probe  = (volatile UBYTE *)framebuffer;
+    *probe = *probe;
+    if (mmu_GetPageUsedModified(mmu_ctx, base) & MAPP_MODIFIED) {
+        mmu_active = TRUE;
+        mmu_stage  = 6;
+    }
 }
 
 /* ---- A314 connection (owned by the diff process only) ------------------- */
@@ -363,6 +522,7 @@ static void zero_shadow(void)
     ULONG *p = (ULONG *)shadow;
     ULONG  n = FB_SIZE / 4;
     while (n--) *p++ = 0;
+    mark_all_rows();          /* everything must be re-sent */
 }
 
 static int send_setmode(void)
@@ -381,6 +541,62 @@ static int send_setswitch(void)
     pkt[0] = CMD_SETSWITCH;
     pkt[1] = switch_state ? 1 : 0;
     return a314_write(pkt, 2);
+}
+
+/* Diagnostic pass-through wrapper around P96's software FillRect: record the
+ * RenderInfo geometry P96 itself renders with, then chain to the original. */
+typedef void (*fillrect_fn)(struct BoardInfo *bi __asm("a0"),
+                            struct RenderInfo *ri __asm("a1"),
+                            WORD x __asm("d0"), WORD y __asm("d1"),
+                            WORD w __asm("d2"), WORD h __asm("d3"),
+                            ULONG color __asm("d4"), UBYTE mask __asm("d5"),
+                            RGBFTYPE fmt __asm("d7"));
+static fillrect_fn orig_FillRect = NULL;
+
+static void my_FillRect(struct BoardInfo *bi __asm("a0"),
+                        struct RenderInfo *ri __asm("a1"),
+                        WORD x __asm("d0"), WORD y __asm("d1"),
+                        WORD w __asm("d2"), WORD h __asm("d3"),
+                        ULONG color __asm("d4"), UBYTE mask __asm("d5"),
+                        RGBFTYPE fmt __asm("d7"))
+{
+    if (ri) {
+        if ((UWORD)ri->BytesPerRow != ri_bpr ||
+            (ULONG)ri->Memory      != ri_mem) {
+            ri_bpr    = (UWORD)ri->BytesPerRow;
+            ri_mem    = (ULONG)ri->Memory;
+            dbg_dirty = TRUE;
+        }
+        /* THE AUTHORITATIVE STRIDE (found 2026-07-24): P96's own renderers
+         * used 5120 B/row here while every derivation from SetPanning's width
+         * guessed 1280 or 2560. Whenever P96 renders into the visible bitmap,
+         * adopt its stride outright - the diff must read what P96 wrote. The
+         * bpr-change detection in diff_pass() then re-diffs everything. */
+        if ((UBYTE *)ri->Memory == visible_base && ri->BytesPerRow > 0 &&
+            (UWORD)ri->BytesPerRow != mode_bpr)
+            mode_bpr = (UWORD)ri->BytesPerRow;
+    }
+    orig_FillRect(bi, ri, x, y, w, h, color, mask, fmt);
+}
+
+/* Ground-truth telemetry for the Pi journal - what the card actually decided
+ * about geometry/format. Sent after every SETMODE. */
+static int send_debug(void)
+{
+    ULONG vb = (ULONG)visible_base, fb = (ULONG)framebuffer;
+    UBYTE pkt[22];
+    pkt[0] = CMD_DEBUG;
+    PW(pkt, 1, pan_width);
+    PW(pkt, 3, mode_bpr);
+    pkt[5] = mode_rgbf;
+    pkt[6] = mode_bpp;
+    pkt[7] = (UBYTE)((mmu_active ? 1 : 0) | (mode_swap ? 2 : 0) |
+                     (mmu_stage << 4));
+    PW(pkt,  8, (UWORD)(vb >> 16));  PW(pkt, 10, (UWORD)vb);
+    PW(pkt, 12, (UWORD)(fb >> 16));  PW(pkt, 14, (UWORD)fb);
+    PW(pkt, 16, ri_bpr);
+    PW(pkt, 18, (UWORD)(ri_mem >> 16)); PW(pkt, 20, (UWORD)ri_mem);
+    return a314_write(pkt, 22);
 }
 
 /* Push the whole 256-entry CLUT (for 8-bit modes), chunked under the 252-byte
@@ -402,160 +618,213 @@ static int send_palette(void)
     return 0;
 }
 
-/* 16-bit (R5G6B5) bounded diff pass. Returns non-zero if the connection died. */
-static int diff_pass16(UWORD w, UWORD h, UWORD bpr, UBYTE *vbase)
+/* 16-bit (R5G6B5) bounded diff of ONE row. Decrements *budget by bytes sent.
+ * Returns non-zero if the connection died. */
+static int diff_row16(UWORD y, UWORD w, UWORD bpr, UBYTE *vbase, LONG *budget)
 {
-    LONG  budget = MAX_BYTES_PER_PASS;
-    UWORD count;
-    UBYTE pkt[256];
+    UBYTE *frow = vbase  + mul16(y, bpr);       /* bitmap stride       */
+    UBYTE *srow = shadow + mul16(y, w * 2);     /* shadow: packed rows */
+    UWORD  col  = 0;
+    UBYTE  pkt[256];
 
-    for (count = 0; count < h; count++) {
-        UWORD  y    = diff_y;
-        ULONG  roff = mul16(y, bpr);
-        UBYTE *frow = vbase  + roff;
-        UBYTE *srow = shadow + roff;
-        UWORD  col  = 0;
+    while (col < w) {
+        UWORD c0, c1, seg, first, i;
+        BOOL  uniform;
 
-        while (col < w) {
-            UWORD c0, c1, seg, first, i;
-            BOOL  uniform;
+        /* skip matching pixels */
+        while (col < w &&
+               *(UWORD *)(frow + col*2) == *(UWORD *)(srow + col*2))
+            col++;
+        if (col >= w) break;
+        c0 = col;
 
-            /* skip matching pixels */
-            while (col < w &&
-                   *(UWORD *)(frow + col*2) == *(UWORD *)(srow + col*2))
-                col++;
-            if (col >= w) break;
-            c0 = col;
+        /* extend across the changed run */
+        while (col < w &&
+               *(UWORD *)(frow + col*2) != *(UWORD *)(srow + col*2))
+            col++;
+        c1  = col;
+        seg = c1 - c0;
 
-            /* extend across the changed run */
-            while (col < w &&
-                   *(UWORD *)(frow + col*2) != *(UWORD *)(srow + col*2))
-                col++;
-            c1  = col;
-            seg = c1 - c0;
+        /* uniform-colour test (for FILL compression) */
+        first   = *(UWORD *)(frow + c0*2);
+        uniform = TRUE;
+        for (i = c0; i < c1; i++) {
+            if (*(UWORD *)(frow + i*2) != first) { uniform = FALSE; break; }
+        }
 
-            /* uniform-colour test (for FILL compression) */
-            first   = *(UWORD *)(frow + c0*2);
-            uniform = TRUE;
-            for (i = c0; i < c1; i++) {
-                if (*(UWORD *)(frow + i*2) != first) { uniform = FALSE; break; }
-            }
-
-            if (uniform && seg >= FILL_MIN_RUN) {
-                pkt[0] = CMD_FILL;
-                PW(pkt, 1, c0);
-                PW(pkt, 3, y);
-                PW(pkt, 5, seg);
+        if (uniform && seg >= FILL_MIN_RUN) {
+            pkt[0] = CMD_FILL;
+            PW(pkt, 1, c0);
+            PW(pkt, 3, y);
+            PW(pkt, 5, seg);
+            if (mode_swap) {                  /* BE mode: swap on the wire */
+                pkt[7] = frow[c0*2 + 1];
+                pkt[8] = frow[c0*2];
+            } else {
                 pkt[7] = frow[c0*2];
                 pkt[8] = frow[c0*2 + 1];
-                if (a314_write(pkt, 9)) return 1;
-                budget -= 9;
-                for (i = c0; i < c1; i++) {       /* shadow = what we sent */
-                    srow[i*2]     = pkt[7];
-                    srow[i*2 + 1] = pkt[8];
-                }
-            } else {
-                i = c0;
-                while (i < c1) {
-                    UWORD n = c1 - i;
-                    UWORD b;
-                    if (n > MAX_PIX_PER_PKT) n = MAX_PIX_PER_PKT;
-                    pkt[0] = CMD_PIXELS;
-                    PW(pkt, 1, i);
-                    PW(pkt, 3, y);
-                    pkt[5] = (UBYTE)n;
-                    for (b = 0; b < n*2; b++) pkt[6 + b] = frow[i*2 + b];
-                    if (a314_write(pkt, (WORD)(6 + n*2))) return 1;
-                    budget -= 6 + n*2;
-                    for (b = 0; b < n*2; b++) srow[i*2 + b] = pkt[6 + b];
-                    i += n;
-                }
             }
-
-            if (budget <= 0) return 0;   /* resume this row next pass */
-        }
-
-        if (++diff_y >= h) diff_y = 0;
-    }
-    return 0;
-}
-
-/* 8-bit (CLUT index) bounded diff pass. Returns non-zero if connection died. */
-static int diff_pass8(UWORD w, UWORD h, UWORD bpr, UBYTE *vbase)
-{
-    LONG  budget = MAX_BYTES_PER_PASS;
-    UWORD count;
-    UBYTE pkt[256];
-
-    for (count = 0; count < h; count++) {
-        UWORD  y    = diff_y;
-        ULONG  roff = mul16(y, bpr);
-        UBYTE *frow = vbase  + roff;
-        UBYTE *srow = shadow + roff;
-        UWORD  col  = 0;
-
-        while (col < w) {
-            UWORD c0, c1, seg, i;
-            UBYTE first;
-            BOOL  uniform;
-
-            while (col < w && frow[col] == srow[col]) col++;
-            if (col >= w) break;
-            c0 = col;
-            while (col < w && frow[col] != srow[col]) col++;
-            c1  = col;
-            seg = c1 - c0;
-
-            first   = frow[c0];
-            uniform = TRUE;
-            for (i = c0; i < c1; i++)
-                if (frow[i] != first) { uniform = FALSE; break; }
-
-            if (uniform && seg >= FILL_MIN_RUN) {
-                pkt[0] = CMD_FILL8;
-                PW(pkt, 1, c0);
+            if (a314_write(pkt, 9)) return 1;
+            *budget -= 9;
+            for (i = c0; i < c1; i++) {       /* shadow = frame bytes */
+                srow[i*2]     = frow[c0*2];
+                srow[i*2 + 1] = frow[c0*2 + 1];
+            }
+        } else {
+            i = c0;
+            while (i < c1) {
+                UWORD n = c1 - i;
+                UWORD b;
+                if (n > MAX_PIX_PER_PKT) n = MAX_PIX_PER_PKT;
+                pkt[0] = CMD_PIXELS;
+                PW(pkt, 1, i);
                 PW(pkt, 3, y);
-                PW(pkt, 5, seg);
-                pkt[7] = first;
-                if (a314_write(pkt, 8)) return 1;
-                budget -= 8;
-                for (i = c0; i < c1; i++) srow[i] = first;
-            } else {
-                i = c0;
-                while (i < c1) {
-                    UWORD n = c1 - i, b;
-                    if (n > MAX_IDX_PER_PKT) n = MAX_IDX_PER_PKT;
-                    pkt[0] = CMD_PIXELS8;
-                    PW(pkt, 1, i);
-                    PW(pkt, 3, y);
-                    pkt[5] = (UBYTE)n;
-                    for (b = 0; b < n; b++) pkt[6 + b] = frow[i + b];
-                    if (a314_write(pkt, (WORD)(6 + n))) return 1;
-                    budget -= 6 + n;
-                    for (b = 0; b < n; b++) srow[i + b] = frow[i + b];
-                    i += n;
+                pkt[5] = (UBYTE)n;
+                if (mode_swap) {              /* BE mode: swap on the wire */
+                    for (b = 0; b < n*2; b += 2) {
+                        pkt[6 + b]     = frow[i*2 + b + 1];
+                        pkt[6 + b + 1] = frow[i*2 + b];
+                    }
+                } else {
+                    for (b = 0; b < n*2; b++) pkt[6 + b] = frow[i*2 + b];
                 }
+                if (a314_write(pkt, (WORD)(6 + n*2))) return 1;
+                *budget -= 6 + n*2;
+                for (b = 0; b < n*2; b++) srow[i*2 + b] = frow[i*2 + b];
+                i += n;
             }
-            if (budget <= 0) return 0;
         }
-        if (++diff_y >= h) diff_y = 0;
+
+        if (*budget <= 0) return 0;   /* resume this row next pass */
     }
     return 0;
 }
 
-/* Dispatch a diff pass by colour depth. Non-zero => connection died.
- * 16-bit-only known-good baseline: 8-bit kept, 32-bit deliberately not mirrored
- * (the 32-bit conversion path was an unverified detour - reverted 2026-06-01). */
+/* 8-bit (CLUT index) bounded diff of ONE row. Non-zero => connection died. */
+static int diff_row8(UWORD y, UWORD w, UWORD bpr, UBYTE *vbase, LONG *budget)
+{
+    UBYTE *frow = vbase  + mul16(y, bpr);       /* bitmap stride       */
+    UBYTE *srow = shadow + mul16(y, w);         /* shadow: packed rows */
+    UWORD  col  = 0;
+    UBYTE  pkt[256];
+
+    while (col < w) {
+        UWORD c0, c1, seg, i;
+        UBYTE first;
+        BOOL  uniform;
+
+        while (col < w && frow[col] == srow[col]) col++;
+        if (col >= w) break;
+        c0 = col;
+        while (col < w && frow[col] != srow[col]) col++;
+        c1  = col;
+        seg = c1 - c0;
+
+        first   = frow[c0];
+        uniform = TRUE;
+        for (i = c0; i < c1; i++)
+            if (frow[i] != first) { uniform = FALSE; break; }
+
+        if (uniform && seg >= FILL_MIN_RUN) {
+            pkt[0] = CMD_FILL8;
+            PW(pkt, 1, c0);
+            PW(pkt, 3, y);
+            PW(pkt, 5, seg);
+            pkt[7] = first;
+            if (a314_write(pkt, 8)) return 1;
+            *budget -= 8;
+            for (i = c0; i < c1; i++) srow[i] = first;
+        } else {
+            i = c0;
+            while (i < c1) {
+                UWORD n = c1 - i, b;
+                if (n > MAX_IDX_PER_PKT) n = MAX_IDX_PER_PKT;
+                pkt[0] = CMD_PIXELS8;
+                PW(pkt, 1, i);
+                PW(pkt, 3, y);
+                pkt[5] = (UBYTE)n;
+                for (b = 0; b < n; b++) pkt[6 + b] = frow[i + b];
+                if (a314_write(pkt, (WORD)(6 + n))) return 1;
+                *budget -= 6 + n;
+                for (b = 0; b < n; b++) srow[i + b] = frow[i + b];
+                i += n;
+            }
+        }
+        if (*budget <= 0) return 0;
+    }
+    return 0;
+}
+
+/* One bounded diff pass. Non-zero => connection died.
+ *
+ * With mmu_active: ask the MMU which pages of the visible window were written
+ * since last pass and only re-diff the rows they cover; everything else costs
+ * one flag check per row. A periodic reconciliation sweep plus pan/stride
+ * change detection guarantee convergence even if the M-bit ever lies.
+ * Without mmu_active: every row is marked dirty every pass = the original
+ * full-scan behaviour, unchanged.
+ *
+ * 16-bit-only known-good baseline: 8-bit kept, 32-bit deliberately not
+ * mirrored (the 32-bit conversion path was an unverified detour - 2026-06-01). */
 static int diff_pass(void)
 {
     UWORD  w = mode_w, h = mode_h, bpr = mode_bpr;
     UBYTE *vbase = visible_base;
+    LONG   budget = MAX_BYTES_PER_PASS;
+    UWORD  count;
+
     if (!w || !h || !bpr || !vbase) return 0;
     if (w > FB_WIDTH_MAX || h > FB_HEIGHT_MAX) return 0;
-    if (mul16(h, bpr) > FB_SIZE) return 0;   /* never index shadow out of range */
-    if (mode_bpp == 16) return diff_pass16(w, h, bpr, vbase);
-    if (mode_bpp == 8)  return diff_pass8 (w, h, bpr, vbase);
-    return 0;                              /* other depths not mirrored */
+    if (mode_bpp != 16 && mode_bpp != 8) return 0;  /* other depths not mirrored */
+    /* The shadow is packed at visible width (w*bytes/px per row) so a WIDE
+     * P96 bitmap allocation can't overrun it; only the frame read uses the
+     * real stride. Just make sure that read stays inside card memory. */
+    if (mul16(w, bpp_bytes(mode_bpp)) > bpr) return 0;    /* nonsense stride */
+    if ((ULONG)vbase - (ULONG)framebuffer + mul16(h, bpr) > CARD_MEM_SIZE)
+        return 0;
+
+    /* The shadow is screen content keyed by row/col; the MMU sees addresses.
+     * After a pan or stride change, page dirt no longer maps to screen dirt -
+     * re-diff everything once. */
+    if ((ULONG)vbase != last_vbase || bpr != last_bpr) {
+        last_vbase = (ULONG)vbase;
+        last_bpr   = bpr;
+        mark_all_rows();
+    }
+
+    if (mmu_active) {
+        ULONG end = (ULONG)vbase + mul16(h, bpr);
+        ULONG pg  = (ULONG)vbase & ~(mmu_pgsz - 1);
+        for (; pg < end; pg += mmu_pgsz) {
+            if (mmu_GetPageUsedModified(mmu_ctx, pg) & MAPP_MODIFIED) {
+                LONG r0 = ((LONG)(pg - (ULONG)vbase)) / (LONG)bpr;
+                LONG r1 = ((LONG)(pg + mmu_pgsz - 1 - (ULONG)vbase)) / (LONG)bpr;
+                if (r0 < 0)        r0 = 0;
+                if (r1 >= (LONG)h) r1 = (LONG)h - 1;
+                for (; r0 <= r1; r0++) dirty_rows[r0] = 1;
+            }
+        }
+        if (++recon_countdown >= RECON_EVERY) {  /* safety net vs missed dirt */
+            recon_countdown = 0;
+            mark_all_rows();
+        }
+    } else {
+        mark_all_rows();       /* no MMU: re-scan all rows, as before */
+    }
+
+    for (count = 0; count < h; count++) {
+        UWORD y = diff_y;
+        if (dirty_rows[y]) {
+            int dead = (mode_bpp == 16)
+                     ? diff_row16(y, w, bpr, vbase, &budget)
+                     : diff_row8 (y, w, bpr, vbase, &budget);
+            if (dead) return 1;
+            if (budget <= 0) return 0;   /* resume at this row next pass */
+            dirty_rows[y] = 0;
+        }
+        if (++diff_y >= h) diff_y = 0;
+    }
+    return 0;
 }
 
 static void diff_task(void)
@@ -574,21 +843,26 @@ static void diff_task(void)
     }
     if (tries >= 8) { a314_close(); diff_running = FALSE; return; }
 
+    mmu_init();              /* optional MMU dirty-tracking fast path */
     zero_shadow();           /* force a full first push */
     mode_changed  = FALSE;
     if (send_setmode())   goto done;
+    if (send_debug())     goto done;
     switch_changed = FALSE;
     if (send_setswitch()) goto done;
 
     for (;;) {
         if (mode_changed)    { mode_changed = FALSE;
                                if (send_setmode()) break;
+                               if (send_debug())   break;
                                zero_shadow(); }
         if (palette_changed) { palette_changed = FALSE;
                                if (send_palette()) break;
                                zero_shadow();   /* re-resolve pixels vs new CLUT */ }
         if (switch_changed)  { switch_changed = FALSE;
                                if (send_setswitch()) break; }
+        if (dbg_dirty)       { dbg_dirty = FALSE;
+                               if (send_debug()) break; }
         if (diff_pass()) break;
         Delay(2);            /* ~40 ms between polls */
     }
@@ -683,19 +957,29 @@ static void SetPanning(
     WORD  unused         __asm("d2"),
     RGBFTYPE rgbf        __asm("d7"))
 {
-    (void)bi; (void)xoffset; (void)yoffset; (void)unused; (void)rgbf;
-    /* `mem` is the base of the currently-displayed bitmap in card memory, and
-     * `width` is that bitmap's row width in pixels - which is the AUTHORITATIVE
-     * stride for reading it. P96 can allocate the bitmap WIDER than the visible
-     * mode (for panning), so reading at the visible-width stride shears the
-     * image. Derive the row stride from SetPanning's width instead. */
+    (void)bi; (void)xoffset; (void)yoffset; (void)unused;
+    /* Big-endian 16-bit formats need their pixel bytes swapped on the wire
+     * (fb0 on the Pi is little-endian RGB565). The PC formats stream as-is. */
+    mode_swap = (rgbf == RGBFB_R5G6B5 || rgbf == RGBFB_R5G5B5) ? TRUE : FALSE;
+    mode_rgbf = (UBYTE)rgbf;
+    /* `width` is the allocated bitmap's row width in PIXELS (proven 2026-07-24
+     * by CMD_DEBUG telemetry: width=1280 for a 640-visible 16-bit screen whose
+     * real stride is 2560 bytes - P96 allocated the bitmap double-wide). The
+     * stride is width * bytes-per-pixel of the mode's RGBFTYPE. The old
+     * "width is already bytes" reading only held when the bitmap width matched
+     * the visible width. Safe now: the shadow is packed at visible width, so a
+     * wide stride can't overrun it (that was the June crash). */
     if (width) {
-        /* `width` is the bitmap's row modulo in BYTES already (e.g. 1280 for a
-         * 640px 16-bit screen) - use it directly as the stride. (Multiplying by
-         * bpp here was the bug: it doubled the stride -> sheared image AND ran
-         * the shadow-buffer index off the end -> memory corruption / crash.) */
+        UWORD pxbytes;
+        switch (rgbf) {
+        case RGBFB_NONE: case RGBFB_CLUT:                     pxbytes = 1; break;
+        case RGBFB_R8G8B8: case RGBFB_B8G8R8:                 pxbytes = 3; break;
+        case RGBFB_A8R8G8B8: case RGBFB_A8B8G8R8:
+        case RGBFB_R8G8B8A8: case RGBFB_B8G8R8A8:             pxbytes = 4; break;
+        default:                                              pxbytes = 2; break;
+        }
         pan_width = width;
-        mode_bpr  = width;
+        mode_bpr  = (UWORD)mul16(width, pxbytes);
     }
     if (mem) { visible_base = mem; mode_changed = TRUE; }
 }
@@ -816,7 +1100,13 @@ static ULONG GetCompatibleFormats(
     RGBFTYPE rgbf        __asm("d7"))
 {
     (void)bi; (void)rgbf;
-    return RGBFF_R5G6B5PC;
+    /* Accept every format we advertise (ZZ9000 returns ~0 here). Returning
+     * only R5G6B5PC made P96 VETO screen opens on the plain big-endian
+     * "16bit" board modes: it silently fell back to a native 8-bit screen
+     * and SetGC never ran - found 2026-07-24 with rtgshow's actual-ModeID/
+     * depth report. The diff handles byte order itself (mode_swap). */
+    return RGBFF_HICOLOR | RGBFF_TRUECOLOR | RGBFF_TRUEALPHA |
+           RGBFF_CLUT | RGBFF_NONE;
 }
 
 static APTR CalculateMemory(
@@ -986,6 +1276,15 @@ BOOL FindCard(struct BoardInfo *bi __asm("a0"))
             dbgf((CONST_STRPTR)"a314rtg: FindCard AllocMem FAILED -> FALSE\n");
             return FALSE;
         }
+        /* The carve is raw RAM at the SAME address every boot - it still
+         * holds every previous session's frames ("ghosts"). Any stride
+         * mismatch then reads old sessions' pixels as if they were current.
+         * Start clean. */
+        {
+            ULONG *p = (ULONG *)framebuffer;
+            ULONG  n = CARD_MEM_SIZE / 4;
+            while (n--) *p++ = 0;
+        }
     }
     if (!shadow) {
         shadow = (UBYTE *)AllocMem(FB_SIZE, MEMF_PUBLIC | MEMF_CLEAR);
@@ -1083,7 +1382,14 @@ BOOL InitCard(
      * pre-fills them with its own software implementations before InitCard,
      * which render straight into our framebuffer. We accelerate nothing, so we
      * override nothing. (Touching them here risks copying a wrong-offset value
-     * into a live pointer -> jump-through-garbage Guru.) */
+     * into a live pointer -> jump-through-garbage Guru.)
+     *
+     * EXCEPTION (diagnostic, 2026-07-24): FillRect is wrapped by a pass-
+     * through that records ri->BytesPerRow/Memory (P96's own idea of the
+     * frame geometry) for CMD_DEBUG, then chains to P96's prefilled
+     * implementation. Same field we write, saved first - no offset guessing. */
+    orig_FillRect = bi->FillRect;
+    if (orig_FillRect) bi->FillRect = my_FillRect;
 
     /* (We do NOT start the diff process here - CreateNewProc from InitCard's
      * context is unsafe and crashes #80000004. It starts from SetGC instead,
