@@ -290,7 +290,15 @@ static BOOL            mmu_active = FALSE;
 static UBYTE           mmu_stage  = 0;  /* how far init got (CMD_DEBUG):
                                          * 0=no lib 1=no ctx 2=bad pgsz
                                          * 3=SetProps failed 4=Rebuild failed
-                                         * 5=probe failed 6=ACTIVE */
+                                         * 5=probe failed 6=ACTIVE
+                                         * 7=visible span > safe budget */
+static ULONG           mmu_base   = 0;  /* singlepaged region (set at stage 6) */
+static ULONG           mmu_size   = 0;
+
+/* SetProperties(MAPP_SINGLEPAGE) requests beyond ~512KB HANG mmu.library
+ * 47.11 on this machine (bisected live 2026-07-24: 512KB passes, 1MB hangs).
+ * Never issue a larger one. */
+#define MMU_SAFE_SPAN  0x80000UL
 
 /* Row-needs-diff flags driving the send loop (indexed by screen row). */
 static UBYTE dirty_rows[FB_HEIGHT_MAX];
@@ -367,17 +375,24 @@ static BOOL mmu_RebuildTree(APTR ctx)           /* LVO -0x060, a0=ctx */
     return (BOOL)res;
 }
 
-/* One-time init, run from the diff process (safe user context). Any failure
- * just leaves mmu_active FALSE - the full-scan fallback is always correct. */
+/* Validation, run from the diff process (safe user context). Any failure just
+ * leaves mmu_active FALSE - the full-scan fallback is always correct.
+ * RE-ENTRANT on purpose: the diff's first run is at BOOT (P96 fires SetGC
+ * during monitor init), which can be before MuForce/MMULib has the MMU tree
+ * up - the probe then fails through no fault of the mechanism. So a failed
+ * validation is retried on every later mode change until it passes; only
+ * success latches. */
 static void mmu_init(void)
 {
     ULONG base, size, p;
     volatile UBYTE *probe;
     static struct TagItem done = { TAG_DONE, 0 };
 
-    if (MMUBase) return;                        /* only try once per boot */
-    MMUBase = OpenLibrary((STRPTR)"mmu.library", 43);
-    if (!MMUBase) return;                       /* V43+ needed for UsedModified */
+    if (mmu_active) return;                     /* validated - nothing to do */
+    if (!MMUBase) {
+        MMUBase = OpenLibrary((STRPTR)"mmu.library", 43);
+        if (!MMUBase) return;                   /* V43+ needed for UsedModified */
+    }
 
     mmu_stage = 1;
     mmu_ctx = mmu_CurrentContext();
@@ -385,14 +400,18 @@ static void mmu_init(void)
     mmu_stage = 2;
     mmu_pgsz = mmu_GetPageSize(mmu_ctx);
     if (!mmu_pgsz || (mmu_pgsz & (mmu_pgsz - 1)) || mmu_pgsz > 65536) return;
+
+    /* Force per-page descriptors over the CURRENT VISIBLE SPAN only. Without
+     * MAPP_SINGLEPAGE, page-level M-bit queries are not permitted - but a
+     * request larger than MMU_SAFE_SPAN hangs the library, so a fat-stride
+     * mode simply stays on the full-scan fallback (stage 7). */
+    if (!visible_base || !mode_bpr || !mode_h) return;
+    base = (ULONG)visible_base & ~(mmu_pgsz - 1);
+    size = (((ULONG)visible_base + mul16(mode_h, mode_bpr) + mmu_pgsz - 1)
+            & ~(mmu_pgsz - 1)) - base;
+    if (size > MMU_SAFE_SPAN) { mmu_stage = 7; return; }
     mmu_stage = 3;
 
-    /* Force per-page descriptors over the whole card memory (visible_base can
-     * sit anywhere inside it). Without MAPP_SINGLEPAGE a large block descriptor
-     * could cover the region and page-level queries are not permitted. */
-    base = (ULONG)framebuffer & ~(mmu_pgsz - 1);
-    size = (((ULONG)framebuffer + CARD_MEM_SIZE + mmu_pgsz - 1)
-            & ~(mmu_pgsz - 1)) - base;
     if (!mmu_SetPropertiesA(mmu_ctx, MAPP_SINGLEPAGE, MAPP_SINGLEPAGE,
                             base, size, (APTR)&done)) return;
     mmu_stage = 4;
@@ -403,11 +422,14 @@ static void mmu_init(void)
      * if the hardware doesn't report it, never trust the MMU on this setup. */
     for (p = base; p < base + size; p += mmu_pgsz)
         (void)mmu_GetPageUsedModified(mmu_ctx, p);
-    probe  = (volatile UBYTE *)framebuffer;
+    probe  = (volatile UBYTE *)visible_base;
     *probe = *probe;
-    if (mmu_GetPageUsedModified(mmu_ctx, base) & MAPP_MODIFIED) {
+    if (mmu_GetPageUsedModified(mmu_ctx,
+            (ULONG)visible_base & ~(mmu_pgsz - 1)) & MAPP_MODIFIED) {
         mmu_active = TRUE;
         mmu_stage  = 6;
+        mmu_base   = base;
+        mmu_size   = size;
     }
 }
 
@@ -792,7 +814,14 @@ static int diff_pass(void)
         mark_all_rows();
     }
 
-    if (mmu_active) {
+    /* Only trust M-bits while the scan span sits inside the region that was
+     * actually single-paged at validation time (panning/mode changes can move
+     * it; re-validation only happens while inactive). */
+    if (mmu_active &&
+        ((ULONG)vbase < mmu_base ||
+         (ULONG)vbase + mul16(h, bpr) > mmu_base + mmu_size)) {
+        mark_all_rows();          /* out of tracked range - full scan */
+    } else if (mmu_active) {
         ULONG end = (ULONG)vbase + mul16(h, bpr);
         ULONG pg  = (ULONG)vbase & ~(mmu_pgsz - 1);
         for (; pg < end; pg += mmu_pgsz) {
@@ -853,6 +882,7 @@ static void diff_task(void)
 
     for (;;) {
         if (mode_changed)    { mode_changed = FALSE;
+                               mmu_init();   /* retry validation if not active */
                                if (send_setmode()) break;
                                if (send_debug())   break;
                                zero_shadow(); }
@@ -991,10 +1021,15 @@ static UWORD CalculateBytesPerRow(
     struct ModeInfo  *mi __asm("a1"),
     RGBFTYPE rgbf        __asm("d7"))
 {
-    UWORD bpr;
     (void)bi; (void)mi; (void)rgbf;
-    bpr = (UWORD)(width * bpp_bytes(depth));
-    return (bpr + 63) & ~63;   /* align to 64 bytes */
+    /* EXACT stride, no alignment padding (ZZ9000 and PiStorm do the same).
+     * The old 64-byte rounding compounded with P96's own width padding into
+     * a 5120 B/row bitmap for a 640-pixel screen - 4x the memory, and a
+     * visible span too large for the MMU dirty-tracking's safe SINGLEPAGE
+     * budget (~512KB; larger requests hang mmu.library). The diff reads
+     * whatever stride P96 ends up with (ri_bpr adoption), so this is purely
+     * an allocation-size hint. */
+    return (UWORD)(width * bpp_bytes(depth));
 }
 
 static BOOL SetDisplay(

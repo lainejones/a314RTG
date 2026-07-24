@@ -15,6 +15,7 @@
 #include <utility/tagitem.h>
 #include <proto/exec.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define MAPP_USED        (1UL << 3)
 #define MAPP_MODIFIED    (1UL << 4)
@@ -79,9 +80,22 @@ static BOOL mmu_RebuildTree(APTR ctx)
     return (BOOL)res;
 }
 
-#define TESTSIZE (64 * 1024)
+static ULONG mmu_GetPagePropertiesA(APTR ctx, ULONG lower)   /* LVO -0x06c */
+{
+    register ULONG res __asm("d0");
+    register APTR  c   __asm("a0") = ctx;
+    register ULONG lo  __asm("a1") = lower;
+    register APTR  tg  __asm("a2") = NULL;
+    register APTR  lib __asm("a6") = (APTR)MMUBase;
+    __asm__ volatile ("jsr -108(%%a6)"
+        : "=r"(res), "+r"(c), "+r"(lo), "+r"(lib)
+        : "r"(tg) : "d1", "cc", "memory");
+    return res;
+}
 
-int main(void)
+static ULONG TESTSIZE = 64 * 1024;   /* override with argv[2] (hex) */
+
+int main(int argc, char **argv)
 {
     APTR   ctx;
     ULONG  pgsz, base, size, p, flags;
@@ -90,6 +104,7 @@ int main(void)
     static struct TagItem done = { TAG_DONE, 0 };
     int    npages, ndirty;
 
+    setvbuf(stdout, NULL, _IONBF, 0);   /* progress visible even if we hang */
     printf("mmutest: a314rtg MMU dirty-tracking validation\n\n");
 
     MMUBase = OpenLibrary((STRPTR)"mmu.library", 43);
@@ -118,17 +133,30 @@ int main(void)
     if (!buf) buf = (UBYTE *)AllocMem(TESTSIZE + pgsz, MEMF_PUBLIC | MEMF_CLEAR);
     if (!buf) { printf("FAIL: no memory\n"); CloseLibrary(MMUBase); return 10; }
 
-    base = ((ULONG)buf + pgsz - 1) & ~(pgsz - 1);   /* page-aligned interior */
+    if (argc > 2) TESTSIZE = strtoul(argv[2], NULL, 16);
+    if (argc > 1 && strtoul(argv[1], NULL, 16) != 0) {
+        /* target mode: validate an EXISTING region (e.g. the card fb from the
+         * CMD_DEBUG line) instead of the fresh allocation */
+        base = strtoul(argv[1], NULL, 16) & ~(pgsz - 1);
+        printf("  TARGET mode: validating region at 0x%08lx\n", base);
+        printf("  props(target) = 0x%08lx   props(pool buf) = 0x%08lx\n",
+               mmu_GetPagePropertiesA(ctx, base),
+               mmu_GetPagePropertiesA(ctx,
+                   ((ULONG)buf + pgsz - 1) & ~(pgsz - 1)));
+    } else {
+        base = ((ULONG)buf + pgsz - 1) & ~(pgsz - 1);  /* page-aligned interior */
+    }
     size = (TESTSIZE / pgsz) * pgsz;
     npages = (int)(size / pgsz);
     printf("  test buffer 0x%08lx, %d pages of %lu\n", base, npages, pgsz);
 
+    printf("  calling SetProperties(SINGLEPAGE, size=0x%lx)...\n", size);
     if (!mmu_SetPropertiesA(ctx, MAPP_SINGLEPAGE, MAPP_SINGLEPAGE,
                             base, size, (APTR)&done)) {
         printf("FAIL: SetProperties(MAPP_SINGLEPAGE) returned FALSE\n");
         goto out;
     }
-    printf("  SetProperties(SINGLEPAGE) = OK\n");
+    printf("  SetProperties(SINGLEPAGE) = OK\n  calling RebuildTree...\n");
 
     if (!mmu_RebuildTree(ctx)) {
         printf("FAIL: RebuildTree returned FALSE\n");
