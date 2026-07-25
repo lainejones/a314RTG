@@ -186,19 +186,23 @@ class RTGService:
                 del b[:8]
                 self._fill8(x, y, n, ci)
             elif c == CMD_DEBUG:
-                if len(b) < 22:
+                if len(b) < 36:
                     break
                 panw, bpr = struct.unpack_from('>HH', b, 1)
                 rgbf, bpp, flags = b[5], b[6], b[7]
                 vb, fb = struct.unpack_from('>II', b, 8)
                 ribpr, = struct.unpack_from('>H', b, 16)
                 rimem, = struct.unpack_from('>I', b, 18)
-                del b[:22]
+                cw, cd, cr = struct.unpack_from('>HHH', b, 22)
+                mctx, mprops = struct.unpack_from('>II', b, 28)
+                del b[:36]
                 log.info('DEBUG panwidth=%d bpr=%d rgbf=%d bpp=%d mmu=%d swap=%d '
                          'mmustage=%d vbase=0x%08x fbase=0x%08x '
-                         'ri_bpr=%d ri_mem=0x%08x',
+                         'ri_bpr=%d ri_mem=0x%08x cbpr(w=%d,d=%d)=%d '
+                         'mmuctx=0x%08x pageprops=0x%08x',
                          panw, bpr, rgbf, bpp, flags & 1, (flags >> 1) & 1,
-                         (flags >> 4) & 15, vb, fb, ribpr, rimem)
+                         (flags >> 4) & 15, vb, fb, ribpr, rimem, cw, cd, cr,
+                         mctx, mprops)
             else:
                 log.warning('unknown command 0x%02x - flushing stream', c)
                 b.clear()

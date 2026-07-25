@@ -185,6 +185,9 @@ static volatile UBYTE mode_bpp  = 16;
 static volatile UBYTE mode_rgbf = 0;     /* raw RGBFTYPE from SetPanning      */
 static volatile UWORD ri_bpr    = 0;     /* P96's own RenderInfo BytesPerRow  */
 static volatile ULONG ri_mem    = 0;     /* ...and Memory, seen in FillRect   */
+static volatile UWORD cbpr_w    = 0;     /* last CalculateBytesPerRow args    */
+static volatile UWORD cbpr_d    = 0;
+static volatile UWORD cbpr_r    = 0;     /* ...and result                     */
 static volatile BOOL  dbg_dirty = FALSE;
 static volatile BOOL  mode_swap = FALSE; /* 16-bit big-endian mode: swap pixel
                                           * bytes into the wire packets so the
@@ -294,6 +297,11 @@ static UBYTE           mmu_stage  = 0;  /* how far init got (CMD_DEBUG):
                                          * 7=visible span > safe budget */
 static ULONG           mmu_base   = 0;  /* singlepaged region (set at stage 6) */
 static ULONG           mmu_size   = 0;
+static ULONG           mmu_props  = 0;  /* GetPageProperties(base) at validate */
+static UWORD           mmu_trial  = 0;  /* probation passes left (stage 8)    */
+static volatile APTR   wr_ctx     = NULL; /* MMU context of a WRITER task,
+                                           * captured inside my_FillRect - the
+                                           * tree the fb writes actually walk */
 
 /* SetProperties(MAPP_SINGLEPAGE) requests beyond ~512KB HANG mmu.library
  * 47.11 on this machine (bisected live 2026-07-24: 512KB passes, 1MB hangs).
@@ -325,6 +333,15 @@ static APTR mmu_CurrentContext(void)            /* LVO -0x0f0, a1=task */
     register APTR lib  __asm("a6") = (APTR)MMUBase;
     __asm__ volatile ("jsr -240(%%a6)"
         : "=r"(res), "+r"(task), "+r"(lib) : : "d1", "a0", "cc", "memory");
+    return res;
+}
+
+static APTR mmu_DefaultContext(void)            /* LVO -0x096, no args */
+{
+    register APTR res __asm("d0");
+    register APTR lib __asm("a6") = (APTR)MMUBase;
+    __asm__ volatile ("jsr -150(%%a6)"
+        : "=r"(res), "+r"(lib) : : "d1", "a0", "a1", "cc", "memory");
     return res;
 }
 
@@ -375,6 +392,19 @@ static BOOL mmu_RebuildTree(APTR ctx)           /* LVO -0x060, a0=ctx */
     return (BOOL)res;
 }
 
+static ULONG mmu_GetPagePropertiesA(APTR ctx, ULONG lower)   /* LVO -0x06c */
+{
+    register ULONG res __asm("d0");
+    register APTR  c   __asm("a0") = ctx;
+    register ULONG lo  __asm("a1") = lower;
+    register APTR  tg  __asm("a2") = NULL;
+    register APTR  lib __asm("a6") = (APTR)MMUBase;
+    __asm__ volatile ("jsr -108(%%a6)"
+        : "=r"(res), "+r"(c), "+r"(lo), "+r"(lib)
+        : "r"(tg) : "d1", "cc", "memory");
+    return res;
+}
+
 /* Validation, run from the diff process (safe user context). Any failure just
  * leaves mmu_active FALSE - the full-scan fallback is always correct.
  * RE-ENTRANT on purpose: the diff's first run is at BOOT (P96 fires SetGC
@@ -395,7 +425,15 @@ static void mmu_init(void)
     }
 
     mmu_stage = 1;
-    mmu_ctx = mmu_CurrentContext();
+    /* Context selection matters enormously here (2026-07-24 findings): the
+     * diff process resolves to the DEFAULT context (0x...e08) but the tasks
+     * that actually WRITE the framebuffer run under a different, hardware-
+     * active context (0x...e18 - MuForce's) where their M-bits land. So use
+     * the context captured from inside a P96 render callback (a writer's own
+     * task); fall back to Default/Current only until one is captured. */
+    mmu_ctx = wr_ctx;
+    if (!mmu_ctx) mmu_ctx = mmu_DefaultContext();
+    if (!mmu_ctx) mmu_ctx = mmu_CurrentContext();
     if (!mmu_ctx) return;
     mmu_stage = 2;
     mmu_pgsz = mmu_GetPageSize(mmu_ctx);
@@ -418,19 +456,20 @@ static void mmu_init(void)
     if (!mmu_RebuildTree(mmu_ctx)) return;
     mmu_stage = 5;
 
-    /* Clear stale M-bits, then prove the path end-to-end with one real write:
-     * if the hardware doesn't report it, never trust the MMU on this setup. */
+    /* Clear stale M-bits. NO self-probe: the diff task is unattached, so its
+     * own write walks the DEFAULT context's tree while we query the WRITER
+     * context - a synthetic probe can never see itself (2026-07-24). Instead
+     * go on PROBATION (stage 8): the diff keeps full-scanning for correctness
+     * while watching for M-bits from REAL renders, which always follow a mode
+     * change. The first genuine dirty page confirms the whole path. */
     for (p = base; p < base + size; p += mmu_pgsz)
         (void)mmu_GetPageUsedModified(mmu_ctx, p);
-    probe  = (volatile UBYTE *)visible_base;
-    *probe = *probe;
-    if (mmu_GetPageUsedModified(mmu_ctx,
-            (ULONG)visible_base & ~(mmu_pgsz - 1)) & MAPP_MODIFIED) {
-        mmu_active = TRUE;
-        mmu_stage  = 6;
-        mmu_base   = base;
-        mmu_size   = size;
-    }
+    mmu_props = mmu_GetPagePropertiesA(mmu_ctx, base);
+    mmu_base  = base;
+    mmu_size  = size;
+    mmu_trial = 200;               /* ~8s of passes to see real traffic */
+    mmu_stage = 8;
+    (void)probe;
 }
 
 /* ---- A314 connection (owned by the diff process only) ------------------- */
@@ -598,6 +637,10 @@ static void my_FillRect(struct BoardInfo *bi __asm("a0"),
             (UWORD)ri->BytesPerRow != mode_bpr)
             mode_bpr = (UWORD)ri->BytesPerRow;
     }
+    /* We are executing in a WRITER task's context right now - capture its MMU
+     * context once for the dirty-tracking validation (see mmu_init). */
+    if (!wr_ctx && MMUBase)
+        wr_ctx = mmu_CurrentContext();
     orig_FillRect(bi, ri, x, y, w, h, color, mask, fmt);
 }
 
@@ -606,7 +649,7 @@ static void my_FillRect(struct BoardInfo *bi __asm("a0"),
 static int send_debug(void)
 {
     ULONG vb = (ULONG)visible_base, fb = (ULONG)framebuffer;
-    UBYTE pkt[22];
+    UBYTE pkt[36];
     pkt[0] = CMD_DEBUG;
     PW(pkt, 1, pan_width);
     PW(pkt, 3, mode_bpr);
@@ -618,7 +661,14 @@ static int send_debug(void)
     PW(pkt, 12, (UWORD)(fb >> 16));  PW(pkt, 14, (UWORD)fb);
     PW(pkt, 16, ri_bpr);
     PW(pkt, 18, (UWORD)(ri_mem >> 16)); PW(pkt, 20, (UWORD)ri_mem);
-    return a314_write(pkt, 22);
+    PW(pkt, 22, cbpr_w);
+    PW(pkt, 24, cbpr_d);
+    PW(pkt, 26, cbpr_r);
+    PW(pkt, 28, (UWORD)((ULONG)mmu_ctx >> 16));
+    PW(pkt, 30, (UWORD)(ULONG)mmu_ctx);
+    PW(pkt, 32, (UWORD)(mmu_props >> 16));
+    PW(pkt, 34, (UWORD)mmu_props);
+    return a314_write(pkt, 36);
 }
 
 /* Push the whole 256-entry CLUT (for 8-bit modes), chunked under the 252-byte
@@ -814,6 +864,27 @@ static int diff_pass(void)
         mark_all_rows();
     }
 
+    /* Probation (stage 8): full-scan for correctness while watching for
+     * M-bits from real renders; the first genuine dirty page activates. */
+    if (!mmu_active && mmu_trial &&
+        (ULONG)vbase >= mmu_base &&
+        (ULONG)vbase + mul16(h, bpr) <= mmu_base + mmu_size) {
+        ULONG end = (ULONG)vbase + mul16(h, bpr);
+        ULONG pg  = (ULONG)vbase & ~(mmu_pgsz - 1);
+        ULONG hits = 0;
+        for (; pg < end; pg += mmu_pgsz)
+            if (mmu_GetPageUsedModified(mmu_ctx, pg) & MAPP_MODIFIED) hits++;
+        if (hits) {
+            mmu_active = TRUE;     /* confirmed by real writer traffic */
+            mmu_stage  = 6;
+            dbg_dirty  = TRUE;
+        } else if (--mmu_trial == 0) {
+            mmu_stage = 5;         /* no M-bits despite rendering - give up */
+            dbg_dirty = TRUE;
+        }
+        mark_all_rows();           /* correctness never depends on probation */
+    }
+
     /* Only trust M-bits while the scan span sits inside the region that was
      * actually single-paged at validation time (panning/mode changes can move
      * it; re-validation only happens while inactive). */
@@ -893,6 +964,10 @@ static void diff_task(void)
                                if (send_setswitch()) break; }
         if (dbg_dirty)       { dbg_dirty = FALSE;
                                if (send_debug()) break; }
+        if (!mmu_active && wr_ctx && mmu_ctx != wr_ctx) {
+            mmu_init();      /* a writer context just got captured - revalidate */
+            dbg_dirty = TRUE;
+        }
         if (diff_pass()) break;
         Delay(2);            /* ~40 ms between polls */
     }
@@ -1017,19 +1092,29 @@ static void SetPanning(
 static UWORD CalculateBytesPerRow(
     struct BoardInfo *bi __asm("a0"),
     UWORD width          __asm("d0"),
-    UWORD depth          __asm("d1"),
+    UWORD height         __asm("d1"),
     struct ModeInfo  *mi __asm("a1"),
     RGBFTYPE rgbf        __asm("d7"))
 {
-    (void)bi; (void)mi; (void)rgbf;
-    /* EXACT stride, no alignment padding (ZZ9000 and PiStorm do the same).
-     * The old 64-byte rounding compounded with P96's own width padding into
-     * a 5120 B/row bitmap for a 640-pixel screen - 4x the memory, and a
-     * visible span too large for the MMU dirty-tracking's safe SINGLEPAGE
-     * budget (~512KB; larger requests hang mmu.library). The diff reads
-     * whatever stride P96 ends up with (ri_bpr adoption), so this is purely
-     * an allocation-size hint. */
-    return (UWORD)(width * bpp_bytes(depth));
+    UWORD pxbytes;
+    (void)bi; (void)mi; (void)height;
+    /* THE 5120-STRIDE BUG (found via cbpr telemetry 2026-07-24): d1 is the
+     * HEIGHT, not a depth - P96 passes the pixel format in d7. Treating
+     * d1(=400) as depth made bpp_bytes() answer 4 bytes/pixel, so every
+     * 16-bit bitmap was allocated at DOUBLE the true stride (and the June-era
+     * "aligned" variant compounded it further). Bytes/pixel must come from
+     * the RGBFTYPE. Exact stride, no alignment (ZZ9000/PiStorm style). */
+    switch (rgbf) {
+    case RGBFB_NONE: case RGBFB_CLUT:                     pxbytes = 1; break;
+    case RGBFB_R8G8B8: case RGBFB_B8G8R8:                 pxbytes = 3; break;
+    case RGBFB_A8R8G8B8: case RGBFB_A8B8G8R8:
+    case RGBFB_R8G8B8A8: case RGBFB_B8G8R8A8:             pxbytes = 4; break;
+    default:                                              pxbytes = 2; break;
+    }
+    cbpr_w = width; cbpr_d = (UWORD)rgbf;
+    cbpr_r = (UWORD)mul16(width, pxbytes);
+    dbg_dirty = TRUE;
+    return cbpr_r;
 }
 
 static BOOL SetDisplay(
