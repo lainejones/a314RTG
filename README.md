@@ -76,30 +76,57 @@ make build      # offline build — produces a314rtg.card
 # (plain `make` also scp-deploys to a Pi share; edit PI_HOST first, or use `build`)
 ```
 
-## Installing — Amiga
+## Installing — Pi (do this first)
 
-Copy from the build:
-
-- `rtg/a314rtg.card` → `LIBS:Picasso96/`
-- a stock Picasso96 **monitor loader** program → `DEVS:Monitors/a314rtg`
-  (board-agnostic; it's the standard P96 monitor, not a custom driver)
-- `rtg/a314rtg.info` → `DEVS:Monitors/a314rtg.info` — its tooltypes **must**
-  include `BOARDTYPE=a314rtg` (that's what makes Picasso96 register the board)
-
-Run `DEVS:Monitors/a314rtg` (or reboot), then run `Picasso96Mode` once to define
-640×480 / 800×600 16-bit (or 8-bit) modes for the A314RTG board.
-
-## Installing — Pi
+On the Pi (needs an existing [a314](https://github.com/niklasekstrom/a314)
+install at `/opt/a314`):
 
 ```bash
-cp pi/rtg.py /opt/a314/                 # alongside a314d
-# register in /etc/a314d.conf for auto-start, e.g.:
-#   rtg   python3 /opt/a314/rtg.py -ondemand
+cd pi
+sudo ./install.sh            # or: sudo ./install.sh /path/to/a314shared
 ```
 
-`/boot/config.txt` must give fb0 a 16bpp mode matching (or larger than) the P96
-mode, e.g. `framebuffer_width=640` / `framebuffer_height=480`. The service
-centres the Amiga screen in fb0.
+This installs `rtg.py`, registers the `rtg` service in
+`/etc/opt/a314/a314d.conf`, restarts `a314d`, and stages the Amiga-side files
+(`a314rtg.card`, the monitor loader, its icon and `Install_A314RTG`) into
+`<shared-dir>/rtg/` so the Amiga can copy them straight off `PiDisk:`.
+
+The Amiga screen is centred 1:1 inside whatever mode fb0 negotiated (black
+surround). Have the HDMI display connected when the Pi boots so fb0 comes up
+at the panel's real resolution rather than a small fallback.
+
+## Installing — Amiga
+
+With `PiDisk:` mounted (after the Pi install staged the files):
+
+```
+cd PiDisk:rtg
+Execute Install_A314RTG
+```
+
+The script checks Picasso96 is present, installs
+`LIBS:Picasso96/a314rtg.card` + `DEVS:Monitors/a314rtg` (+`.info` — its
+`BOARDTYPE=a314rtg` tooltype is what makes P96 register the board), then
+prints the one-time mode setup:
+
+1. Reboot (the monitor loader registers the card at boot).
+2. `SYS:Prefs/P96Prefs` → the `a314rtg` item → **Add default modes** → Save →
+   let it reboot. This creates board-attached `A314RTG:` screenmodes — modes
+   named `no board:` mean this step is missing and screens will not reach
+   the board.
+3. `SYS:Prefs/ScreenMode` → pick an `A314RTG:` mode (e.g.
+   `A314RTG:640x400 16bit PC`) → **Use** to try, **Save** to keep.
+
+## MMU dirty-page tracking (68030, optional)
+
+On machines running Thomas Richter's `mmu.library` V43+ (the MMULib package),
+the diff process asks the MMU which framebuffer pages were written instead of
+re-comparing the whole framebuffer every pass — near-zero CPU cost while the
+screen is static. It's fully self-configuring: the card validates the whole
+path against real render traffic at mode-switch time and silently stays on
+the classic full-scan diff when there's no MMU, no mmu.library, or a mode
+whose bitmap exceeds the safe tracking budget (~512 KB span). No separate
+builds, no tooltypes — machines without an MMU just work.
 
 ## Wire protocol (Amiga → Pi)
 

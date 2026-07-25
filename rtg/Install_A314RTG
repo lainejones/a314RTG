@@ -1,0 +1,54 @@
+; A314RTG Amiga-side installer.
+;
+; Run from the drawer that holds a314rtg.card, a314rtg and a314rtg.info
+; (e.g. PiDisk:rtg after the Pi-side install.sh staged them):
+;
+;     cd PiDisk:rtg
+;     Execute Install_A314RTG
+;
+; Copies the Picasso96 card driver, the monitor loader and its icon into
+; place. The first-boot Picasso96 configuration (mode creation) is a one-time
+; manual step in P96Prefs - instructions are printed at the end.
+
+failat 21
+
+; ---- prerequisites ------------------------------------------------------
+if not exists LIBS:Picasso96
+  echo "*** Picasso96 is not installed (no LIBS:Picasso96 drawer)."
+  echo "*** Install Picasso96/P96 first, then re-run this script."
+  quit 10
+endif
+
+if not exists DEVS:a314.device
+  echo "WARNING: DEVS:a314.device not found - the RTG screen will not"
+  echo "         reach the Pi until the a314 software is installed."
+  echo "         (Continuing anyway; the card itself is harmless.)"
+endif
+
+if not exists a314rtg.card
+  echo "*** a314rtg.card not found in the current directory."
+  echo "*** cd into the drawer holding the A314RTG files first."
+  quit 10
+endif
+
+; ---- install ------------------------------------------------------------
+copy a314rtg.card LIBS:Picasso96/a314rtg.card CLONE
+echo "installed LIBS:Picasso96/a314rtg.card"
+
+copy a314rtg DEVS:Monitors/a314rtg CLONE
+copy a314rtg.info DEVS:Monitors/a314rtg.info CLONE
+echo "installed DEVS:Monitors/a314rtg (+.info)"
+
+; ---- what's next --------------------------------------------------------
+echo ""
+echo "A314RTG installed. One-time Picasso96 setup still needed:"
+echo ""
+echo "  1. Reboot (the monitor loads the card at boot)."
+echo "  2. Open SYS:Prefs/P96Prefs, click the >a314rtg item,"
+echo "     press 'Add default modes', then Save and let it reboot."
+echo "  3. Open SYS:Prefs/ScreenMode and pick an 'A314RTG:' mode"
+echo "     (e.g. A314RTG:640x400 16bit PC) - Use to try it, Save to keep it."
+echo ""
+echo "Make sure the Pi side is installed too (pi/install.sh) so the"
+echo "'rtg' service is registered with a314d - the screen appears on"
+echo "the Pi's HDMI output."
