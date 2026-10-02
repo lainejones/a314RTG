@@ -82,7 +82,9 @@ elif [ -d "$SHARE" ]; then
     install -m 644 "$AMIGA_DIR/a314rtg.card" "$SHARE/rtg/a314rtg.card"
     # DEVS:Monitors file is the stock board-agnostic P96 loader, deployed
     # WITHOUT an extension so it can be copied straight to DEVS:Monitors/
-    install -m 644 "$MONITOR"               "$SHARE/rtg/a314rtg"
+    # 755: it is a program (a314fs keeps AmigaDOS bits in its own metadata,
+    # so this matters only to other ways of sharing the dir, e.g. Samba)
+    install -m 755 "$MONITOR"               "$SHARE/rtg/a314rtg"
     install -m 644 "$AMIGA_DIR/a314rtg.info" "$SHARE/rtg/a314rtg.info"
     # AmigaDOS chokes on CR line endings - normalize while staging
     tr -d '\r' < "$AMIGA_DIR/Install_A314RTG" > "$SHARE/rtg/Install_A314RTG"

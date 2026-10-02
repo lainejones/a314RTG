@@ -37,6 +37,9 @@ echo "installed LIBS:Picasso96/a314rtg.card"
 
 copy a314rtg DEVS:Monitors/a314rtg CLONE
 copy a314rtg.info DEVS:Monitors/a314rtg.info CLONE
+; the loader is run at boot: make sure it is executable (a .zip or some
+; network shares drop the AmigaDOS protection bits)
+protect DEVS:Monitors/a314rtg +e
 echo "installed DEVS:Monitors/a314rtg (+.info)"
 
 ; ---- what's next --------------------------------------------------------

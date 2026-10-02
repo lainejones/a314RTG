@@ -39,6 +39,43 @@ A static screen costs ~no traffic; a full repaint trickles over a few seconds.
 - Amiga 1200 (developed on 68030 @ 50 MHz, 128 MB FastRAM) with an A314 board
 - A Raspberry Pi connected to the A314, booted to console (no X11)
 
+## Requirements
+
+Amiga:
+
+- **68020 or better.** The card driver is built with `-m68020` and will not run
+  on a plain 68000 (an A500 with the A314 needs an accelerator).
+- **Picasso96** installed (`LIBS:Picasso96/` must exist; the installer checks).
+  Picasso96 itself needs AmigaOS 3.0 or newer. Developed and tested on
+  AmigaOS 3.2.3.
+- The **A314 Amiga software** (`DEVS:a314.device`) and `PiDisk:` (a314fs) if
+  you install from the Pi share.
+- Optional: Thomas Richter's MMULib (`mmu.library` V43+) on a 68030/040/060 for
+  the cheaper dirty-page tracking described below.
+
+Pi:
+
+- The **A314 Pi software** installed at `/opt/a314` with `a314d` running
+  (normally as the `a314d` systemd service).
+- Python 3 (the A314 venv at `/opt/a314/venv` is used when present; `rtg.py`
+  needs only the standard library).
+- Booted to the **console, no X11/desktop**, with an HDMI display attached at
+  boot, so `/dev/fb0` is the HDMI framebuffer at **16 bpp** (the console default).
+
+## Versions
+
+The package and the card driver are numbered separately:
+
+| Component | Version | How to check |
+|-----------|---------|--------------|
+| Release package (archive name, GitHub tag) | **1.0.1** | the archive name |
+| `a314rtg.card` (Amiga card driver) | **1.1** (24.07.2026) | `Version a314rtg.card` in a Shell once the card is loaded (after the reboot) |
+| `pi/install.sh`, `pi/rtg.py` | no own number; ship with the package | |
+
+Release 1.0.1 changed only the Pi-side `install.sh` (it stages from a release
+package and finds `a314d.conf` in more places); the card driver is the same 1.1
+build as in release 1.0.
+
 ## Repository layout
 
 ```
@@ -86,10 +123,16 @@ cd pi
 sudo ./install.sh            # or: sudo ./install.sh /path/to/a314shared
 ```
 
-This installs `rtg.py`, registers the `rtg` service in
-`/etc/opt/a314/a314d.conf`, restarts `a314d`, and stages the Amiga-side files
-(`a314rtg.card`, the monitor loader, its icon and `Install_A314RTG`) into
-`<shared-dir>/rtg/` so the Amiga can copy them straight off `PiDisk:`.
+This installs `rtg.py` to `/opt/a314/`, registers the `rtg` service in
+`a314d.conf` (so `a314d` starts `rtg.py` on demand - no manual start needed),
+restarts `a314d`, and stages the Amiga-side files (`a314rtg.card`, the monitor
+loader, its icon and `Install_A314RTG`) into `<shared-dir>/rtg/` so the Amiga
+can copy them straight off `PiDisk:`. The shared dir defaults to
+`/home/<your user>/a314shared`; pass `-` to skip staging.
+
+`install.sh` looks for `a314d.conf` in `/etc/opt/a314/` (where the A314
+installer puts it), `/opt/a314/`, `/etc/` and `/etc/a314/`. If yours is
+elsewhere, name it: `sudo CONF=/path/to/a314d.conf ./install.sh`.
 
 The Amiga screen is centred 1:1 inside whatever mode fb0 negotiated (black
 surround). Have the HDMI display connected when the Pi boots so fb0 comes up
@@ -106,8 +149,8 @@ Execute Install_A314RTG
 
 The script checks Picasso96 is present, installs
 `LIBS:Picasso96/a314rtg.card` + `DEVS:Monitors/a314rtg` (+`.info` — its
-`BOARDTYPE=a314rtg` tooltype is what makes P96 register the board), then
-prints the one-time mode setup:
+`BOARDTYPE=a314rtg` tooltype is what makes P96 register the board), makes the
+monitor loader executable, then prints the one-time mode setup:
 
 1. Reboot (the monitor loader registers the card at boot).
 2. `SYS:Prefs/P96Prefs` → the `a314rtg` item → **Add default modes** → Save →
@@ -116,6 +159,12 @@ prints the one-time mode setup:
    the board.
 3. `SYS:Prefs/ScreenMode` → pick an `A314RTG:` mode (e.g.
    `A314RTG:640x400 16bit PC`) → **Use** to try, **Save** to keep.
+
+Installing by hand, from the unpacked archive instead of `PiDisk:`: copy
+`a314rtg.card` to `LIBS:Picasso96/`, and `a314rtg` + `a314rtg.info` to
+`DEVS:Monitors/`. Use the `.lha` archive if you can: a `.zip` loses AmigaDOS
+protection bits, so after a `.zip` run `protect DEVS:Monitors/a314rtg +e`
+(`Install_A314RTG` does this for you).
 
 ## MMU dirty-page tracking (68030, optional)
 
@@ -151,8 +200,9 @@ also little-endian RGB565 — no colour conversion).
   Workbench renders on HDMI (16-bit and 8-bit). Key gotchas solved: romtag must
   be `RTF_AUTOINIT` (0x80); `SetPanning`'s `width` is already the row stride in
   bytes (don't multiply by bpp).
-- **M3 — planned:** forward FillRect/BlitRect as real ops (speed), resolutions
-  beyond 800×600, auto-start `rtg.py` via a314d.
+- **M3 — partly done:** `rtg.py` is auto-started by a314d (`pi/install.sh`
+  registers it); MMU dirty-page tracking cuts the diff cost. Still planned:
+  forward FillRect/BlitRect as real ops (speed), resolutions beyond 800×600.
 
 ## License
 
